@@ -46,6 +46,10 @@ function HTTP_SWITCH(log, config) {
         this.timeout = 1000;
     }
 
+    this.offCooldownDuration = 2 * 60 * 1000; // 2 minutes in ms
+    this.cooldownActive = false;
+    this.cooldownTimer = null;
+
     if (config.serialNumber !== undefined && typeof config.serialNumber === "string") {
         this.serialNumber = config.serialNumber;
     }
@@ -324,6 +328,11 @@ HTTP_SWITCH.prototype = {
                 return;
         }
 
+        if (this.cooldownActive && value) {
+            this.log("Ignoring ON notification during off cooldown");
+            return;
+        }
+
         if (this.debug)
             this.log("Updating '" + body.characteristic + "' to new value: " + body.value);
 
@@ -339,6 +348,13 @@ HTTP_SWITCH.prototype = {
 
         switch (this.switchType) {
             case SwitchType.STATEFUL:
+                if (this.cooldownActive) {
+                    if (this.debug)
+                        this.log("getStatus() returning OFF (cooldown active)");
+                    callback(null, false);
+                    break;
+                }
+
                 if (!this.statusCache.shouldQuery()) {
                     const value = this.homebridgeService.getCharacteristic(Characteristic.On).value;
                     if (this.debug)
@@ -393,9 +409,29 @@ HTTP_SWITCH.prototype = {
         }
     },
 
+    _startCooldown: function () {
+        this.cooldownActive = true;
+        if (this.cooldownTimer)
+            clearTimeout(this.cooldownTimer);
+        this.cooldownTimer = setTimeout(() => {
+            this.cooldownActive = false;
+            this.cooldownTimer = null;
+            if (this.debug)
+                this.log("Off cooldown period ended");
+        }, this.offCooldownDuration);
+        if (this.debug)
+            this.log("Off cooldown started (2 minutes)");
+    },
+
     setStatus: function (on, callback) {
         if (this.pullTimer)
             this.pullTimer.resetTimer();
+
+        if (on && this.cooldownActive) {
+            this.log("Cannot turn on: switch is in 2-minute off cooldown");
+            callback(new Error("Switch is in off cooldown"));
+            return;
+        }
 
         switch (this.switchType) {
             case SwitchType.STATEFUL:
@@ -440,6 +476,12 @@ HTTP_SWITCH.prototype = {
 
             results.forEach((result, i) => {
                 if (result.error) {
+                    const isTimeout = result.error.code === 'ESOCKETTIMEDOUT' || result.error.code === 'ETIMEDOUT';
+                    if (!on && isTimeout) {
+                        this.log("Off command timed out (device likely asleep) — treating as success");
+                        successes.push({ index: i, value: null });
+                        return;
+                    }
                     errors.push({
                         index: i,
                         error: result.error
@@ -491,6 +533,8 @@ HTTP_SWITCH.prototype = {
             else {
                 if (this.debug)
                     this.log(`Successfully set switch to ${on ? "ON" : "OFF"}${successes.length > 1 ? ` with every request (${successes.length})` : ""}`);
+                if (!on)
+                    this._startCooldown();
                 callback();
             }
 
